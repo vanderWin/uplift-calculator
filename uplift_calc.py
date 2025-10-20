@@ -24,6 +24,13 @@ DEFAULT_CTR_VALUES = [
 PRIMARY_COLOR = "#AAA0FF"
 DEFAULT_CATEGORY_LABEL = "Uncategorized"
 DEFAULT_INTENT_LABEL = "Other Intent"
+DEFAULT_RANK_CAPS = {
+    "Easy": None,
+    "Medium": 2,
+    "Hard": 3,
+    "Top10": None,
+    "N/A": 2,
+}
 
 if "ctr_values" not in st.session_state:
     st.session_state["ctr_values"] = DEFAULT_CTR_VALUES.copy()
@@ -41,24 +48,37 @@ with st.sidebar:
     col_keyword = st.selectbox("Keyword column", options=df.columns.tolist(), index=0)
     col_volume  = st.selectbox("Monthly search volume", options=df.columns.tolist(), index=df.columns.get_loc("VOLUME") if "VOLUME" in df.columns else 0)
     # Optional DIFFICULTY; fallback to Medium
-    col_diff    = st.selectbox("Difficulty (optional)", options=["<none>"] + df.columns.tolist(),
+    col_diff    = st.selectbox("Keyword Difficulty", options=["<none>"] + df.columns.tolist(),
                                index=(df.columns.get_loc("DIFFICULTY")+1) if "DIFFICULTY" in df.columns else 0)
 
     # Starting rank (if absent, default 100)
     guess_rank_cols = [c for c in df.columns if "RANK" in c.upper() and "[M]" in c.upper()]
-    col_rank = st.selectbox("Starting rank (optional)", options=["<none>"] + df.columns.tolist(),
+    col_rank = st.selectbox("Starting rank", options=["<none>"] + df.columns.tolist(),
                             index=(df.columns.get_loc(guess_rank_cols[0])+1) if guess_rank_cols else 0)
 
     col_intent = st.selectbox(
-        "Intent column (optional)",
+        "Intent column",
         options=["<none>"] + df.columns.tolist(),
         index=(df.columns.get_loc("INTENT") + 1) if "INTENT" in df.columns else 0,
     )
     col_group = st.selectbox(
-        "Main keyword group (optional)",
+        "Main keyword group",
         options=["<none>"] + df.columns.tolist(),
         index=(df.columns.get_loc("GROUPS") + 1) if "GROUPS" in df.columns else 0,
     )
+
+def _normalize_difficulty_label(value):
+    text = str(value).strip()
+    return text if text else "N/A"
+
+if col_diff != "<none>":
+    diffs_present = [_normalize_difficulty_label(v) for v in df[col_diff].unique()]
+else:
+    diffs_present = []
+
+default_keys = ["Easy", "Medium", "Hard", "Top10", "N/A"]
+keys = list(dict.fromkeys(default_keys + diffs_present))
+default_map = {"Easy": 0.6, "Medium": 1.0, "Hard": 1.6, "Top10": 2.2, "N/A": 1.0}
 
 # ---------- Parameters ----------
 with st.sidebar:
@@ -71,6 +91,28 @@ with st.sidebar:
     value=12,
     help="Projection window length for rank and traffic projection."
     )
+
+    st.divider()
+    st.subheader("Rank caps by difficulty")
+    st.caption("Limit how far each difficulty tier can climb. Set to 'No cap' to allow improvements to position 1.")
+    cap_options = [("No cap", None)] + [(f"Position {i}", i) for i in range(1, 21)]
+    rank_caps = {}
+    for key in keys:
+        default_cap = DEFAULT_RANK_CAPS.get(key, None)
+        default_index = 0
+        if default_cap is not None:
+            for idx, (_, val) in enumerate(cap_options):
+                if val == default_cap:
+                    default_index = idx
+                    break
+        selection = st.selectbox(
+            f"{key}",
+            cap_options,
+            index=default_index,
+            format_func=lambda option: option[0],
+            key=f"rank_cap_{key}",
+        )
+        rank_caps[key] = selection[1]
 
     st.divider()
     st.header("Phase Durations")
@@ -121,11 +163,6 @@ with st.sidebar:
     st.subheader("Difficulty multipliers")
     # Values when DIFFICULTY missing or custom categories
     st.caption("Difficulty multipliers: smaller = easier and faster ranking gains; larger = harder and slower progress.")
-    diffs_present = df[col_diff].dropna().unique().tolist() if col_diff != "<none>" else []
-    default_keys = ["Easy","Medium","Hard","Top10"]
-    keys = sorted(set(default_keys + diffs_present), key=lambda x: default_keys.index(x) if x in default_keys else 999)
-
-    default_map = {"Easy":0.6,"Medium":1.0,"Hard":1.6,"Top10":2.2,"N/A":1.0}
     m_d = {}
     for key in keys:
         m_d[key] = st.number_input(f"{key}", min_value=0.1, value=float(default_map.get(key, 1.2)), step=0.1)
@@ -316,6 +353,7 @@ model_signature = (
     col_intent,
     col_group,
     tuple(sorted((str(key), float(val)) for key, val in m_d.items())),
+    tuple(sorted((str(key), None if val is None else float(val)) for key, val in rank_caps.items())),
 )
 
 # selection
@@ -420,6 +458,18 @@ ctr_values = st.session_state["ctr_values"]
 
 # ---------- Single keyword projection ----------
 def project_keyword(row, months):
+    diff_label = str(row["DIFFICULTY"])
+    cap_value = rank_caps.get(diff_label, None)
+    if cap_value is not None:
+        try:
+            cap_value = max(1.0, float(cap_value))
+        except (TypeError, ValueError):
+            cap_value = None
+
+    start_rank_value = float(row["START_RANK"])
+    if cap_value is not None and start_rank_value <= cap_value:
+        cap_value = None
+
     ranks = []
     for t in range(months+1):
         r = rank_at_month(
@@ -430,7 +480,10 @@ def project_keyword(row, months):
             diff_label=row["DIFFICULTY"],
             k=k
         )
-        ranks.append(max(1.0, float(r)))
+        r = max(1.0, float(r))
+        if cap_value is not None:
+            r = max(r, cap_value)
+        ranks.append(r)
     return np.array(ranks)
 
 
