@@ -1,5 +1,6 @@
 # uplift_calc.py
 import math
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -34,6 +35,12 @@ DEFAULT_RANK_CAPS = {
 
 if "ctr_values" not in st.session_state:
     st.session_state["ctr_values"] = DEFAULT_CTR_VALUES.copy()
+if "ctr_dialog_open" not in st.session_state:
+    st.session_state["ctr_dialog_open"] = False
+if "ctr_bulk_text" not in st.session_state:
+    st.session_state["ctr_bulk_text"] = ""
+if "ctr_bulk_error" not in st.session_state:
+    st.session_state["ctr_bulk_error"] = ""
 
 with st.sidebar:
     st.header("Data")
@@ -273,6 +280,78 @@ def normalize_ctr_values(values, n=20):
         arr += [0.0] * (n - len(arr))
     return arr
 
+
+def parse_ctr_bulk_input(blob, expected=20):
+    """Parse pasted CTR percentages and return a list of floats in percent units."""
+    if not blob:
+        return [], "No values provided."
+
+    # Replace common separators with whitespace to make splitting reliable
+    cleaned_text = blob.replace(",", " ").strip()
+    # Extract numeric components (allows for values like 6.0% or 0.62)
+    tokens = re.findall(r"-?\d+(?:\.\d+)?", cleaned_text.replace("%", " "))
+    values = []
+    for token in tokens:
+        try:
+            values.append(round(float(token), 2))
+        except ValueError:
+            return [], f"Unable to read value '{token}'."
+
+    if len(values) != expected:
+        return [], f"Expected {expected} values, but found {len(values)}."
+
+    if any(v < 0 for v in values):
+        return [], "CTR values must be zero or greater."
+
+    return values, ""
+
+
+def ctr_bulk_dialog(expected=20):
+    st.markdown("#### Bulk paste CTR values")
+    st.write("Paste CTR percentages (one per line). Percent signs are optional.")
+
+    st.text_area(
+        "CTR values",
+        key="ctr_bulk_text",
+        height=220,
+        placeholder="6.00%\n3.19%\n...",
+    )
+
+    error_msg = st.session_state.get("ctr_bulk_error", "")
+    if error_msg:
+        st.error(error_msg)
+
+    apply_col, close_col = st.columns(2)
+    apply_clicked = apply_col.button(
+        "Apply",
+        use_container_width=True,
+        key="ctr_bulk_apply",
+    )
+    close_clicked = close_col.button(
+        "Close",
+        use_container_width=True,
+        key="ctr_bulk_close",
+    )
+
+    if apply_clicked:
+        values, error = parse_ctr_bulk_input(
+            st.session_state.get("ctr_bulk_text", ""),
+            expected=expected,
+        )
+        if error:
+            st.session_state["ctr_bulk_error"] = error
+            st.session_state["ctr_dialog_open"] = True
+            return
+
+        decimals = [round(v / 100.0, 4) for v in values]
+        st.session_state["ctr_values"] = normalize_ctr_values(decimals, expected)
+        st.session_state["ctr_bulk_error"] = ""
+        st.session_state["ctr_dialog_open"] = False
+
+    if close_clicked:
+        st.session_state["ctr_dialog_open"] = False
+        st.session_state["ctr_bulk_error"] = ""
+
 def ctr_top20(rank, arr):
     r = int(round(rank))
     if 1 <= r <= len(arr):
@@ -428,6 +507,17 @@ with r1_col1:
 with r1_col2:
     st.subheader("Click through curve (CTR)")
     st.caption("Adjust CTR for ranks 1-20; changes update all projections.")
+
+    if st.button("Bulk paste CTR values", key="open_ctr_dialog"):
+        st.session_state["ctr_dialog_open"] = True
+        st.session_state["ctr_bulk_error"] = ""
+        st.session_state["ctr_bulk_text"] = "\n".join(
+            f"{v * 100:.2f}%" for v in st.session_state["ctr_values"]
+        )
+
+    if st.session_state.get("ctr_dialog_open"):
+        ctr_bulk_dialog(expected=20)
+
     ctr_table_df = pd.DataFrame({
         "Rank": list(range(1, 21)),
         "CTR (%)": [v * 100 for v in st.session_state["ctr_values"]],
@@ -441,7 +531,7 @@ with r1_col2:
         column_config={
             "Rank": st.column_config.NumberColumn("Rank", disabled=True),
             "CTR (%)": st.column_config.NumberColumn(
-                "CTR (%)", format="%.1f", step=0.1, min_value=0.0, max_value=100.0
+                "CTR (%)", format="%.2f", step=0.01, min_value=0.0, max_value=100.0
             ),
         },
     )
