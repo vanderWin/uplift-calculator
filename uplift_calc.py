@@ -39,6 +39,10 @@ DEFAULT_RANK_CAPS = {
 }
 AHREFS_INTENT_FLAGS = ["Branded", "Local", "Navigational", "Informational", "Commercial", "Transactional"]
 COMPETITION_TO_DIFFICULTY = {"HIGH": "High", "MEDIUM": "Medium", "LOW": "Low"}
+GEO_OPTIONS = {
+    "United Kingdom": "2826",
+    "United States": "2840",
+}
 
 
 def _detect_encoding(raw_bytes: bytes) -> str:
@@ -94,6 +98,9 @@ with st.sidebar:
         horizontal=True,
         help="Choose the format of the uploaded CSV.",
     )
+    country_label = st.radio("Google Ads country", ["United Kingdom", "United States"], index=0, horizontal=True)
+    geo_id_selected = GEO_OPTIONS[country_label]
+    geo_ids = [geo_id_selected]
     upl = st.file_uploader("Upload CSV", type=["csv"])
     if upl is None:
         st.warning("Upload a CSV to get started.")
@@ -496,6 +503,8 @@ if col_group != "<none>":
     selected_cols.append(col_group)
 if intent_flag_cols:
     selected_cols.extend(intent_flag_cols)
+if "Country" in df.columns:
+    selected_cols.append("Country")
 
 selected_cols = list(dict.fromkeys(selected_cols))
 work = df[selected_cols].copy()
@@ -509,6 +518,8 @@ if col_intent != "<none>":
     rename_map[col_intent] = "INTENT"
 if col_group != "<none>":
     rename_map[col_group] = "CATEGORY"
+if "Country" in work.columns:
+    rename_map["Country"] = "COUNTRY"
 
 work.rename(columns=rename_map, inplace=True)
 
@@ -779,7 +790,7 @@ if proj_mode == "Seasonal":
         proceed_with_fetch = False
 
     # Derive default geo/language from secrets or defaults
-    geo_ids = _DEFAULT_GEO_IDS
+    geo_ids = [geo_id_selected] if geo_id_selected else _DEFAULT_GEO_IDS
     lang_id = _DEFAULT_LANGUAGE_ID
     try:
         if "google_ads" in st.secrets:
@@ -1107,7 +1118,9 @@ def batch_forecast(work_df, horizon, ctr_arr_tuple, model_signature, intent_mode
             uplift_vs = float(vs) - float(base_vs)
             out_rows.append({
                 "KEYWORD": rw["KEYWORD"],
+                "COUNTRY": rw.get("COUNTRY", ""),
                 "VOLUME": int(rw["VOLUME"]),
+                "MONTHLY_VOLUME": float(vols[m]),
                 "DIFFICULTY": rw["DIFFICULTY"],
                 "START_RANK": int(rw["START_RANK"]),
                 "CATEGORY": rw.get("CATEGORY", DEFAULT_CATEGORY_LABEL),
