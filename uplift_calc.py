@@ -1,6 +1,10 @@
 # uplift_calc.py
+import csv
+import io
 import math
 import re
+import codecs
+import time
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -33,6 +37,44 @@ DEFAULT_RANK_CAPS = {
     "Top10": None,
     "N/A": 2,
 }
+AHREFS_INTENT_FLAGS = ["Branded", "Local", "Navigational", "Informational", "Commercial", "Transactional"]
+COMPETITION_TO_DIFFICULTY = {"HIGH": "High", "MEDIUM": "Medium", "LOW": "Low"}
+
+
+def _detect_encoding(raw_bytes: bytes) -> str:
+    if raw_bytes.startswith(codecs.BOM_UTF16_LE) or raw_bytes.startswith(codecs.BOM_UTF16_BE):
+        return "utf-16"
+    if raw_bytes.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+    return "utf-8"
+
+
+def _detect_delimiter(sample_text: str) -> str:
+    try:
+        dialect = csv.Sniffer().sniff(sample_text, delimiters=[",", "\t", ";", "|"])
+        return dialect.delimiter
+    except Exception:
+        for delim in ("\t", ",", ";", "|"):
+            if delim in sample_text:
+                return delim
+    return ","
+
+
+def _load_uploaded_csv(uploaded_file) -> pd.DataFrame:
+    raw_bytes = uploaded_file.getvalue()
+    encoding = _detect_encoding(raw_bytes)
+    sample_text = raw_bytes[:8192].decode(encoding, errors="ignore")
+    delimiter = _detect_delimiter(sample_text)
+    buffer = io.BytesIO(raw_bytes)
+    try:
+        return pd.read_csv(buffer, encoding=encoding, sep=delimiter, low_memory=False, keep_default_na=False)
+    except UnicodeDecodeError:
+        fallback = "utf-16" if encoding == "utf-8" else "utf-8"
+        buffer.seek(0)
+        sample_text = raw_bytes[:8192].decode(fallback, errors="ignore")
+        delimiter = _detect_delimiter(sample_text)
+        return pd.read_csv(buffer, encoding=fallback, sep=delimiter, low_memory=False, keep_default_na=False)
+
 
 if "ctr_values" not in st.session_state:
     st.session_state["ctr_values"] = DEFAULT_CTR_VALUES.copy()
@@ -45,48 +87,110 @@ if "ctr_bulk_error" not in st.session_state:
 
 with st.sidebar:
     st.header("Data")
+    data_source = st.radio(
+        "Data source",
+        ["SEOmonitor", "Ahrefs"],
+        index=0,
+        horizontal=True,
+        help="Choose the format of the uploaded CSV.",
+    )
     upl = st.file_uploader("Upload CSV", type=["csv"])
     if upl is None:
         st.warning("Upload a CSV to get started.")
         st.stop()
-    df = pd.read_csv(upl, low_memory=False, keep_default_na=False)
+    try:
+        df = _load_uploaded_csv(upl)
+    except Exception as exc:
+        st.error(f"Could not read CSV: {exc}")
+        st.stop()
 
-    # Column mapping
-    st.subheader("Column mapping")
-    col_keyword = st.selectbox("Keyword column", options=df.columns.tolist(), index=0)
-    col_volume  = st.selectbox("Monthly search volume", options=df.columns.tolist(), index=df.columns.get_loc("VOLUME") if "VOLUME" in df.columns else 0)
-    # Optional DIFFICULTY; fallback to Medium
-    col_diff    = st.selectbox("Keyword Difficulty", options=["<none>"] + df.columns.tolist(),
-                               index=(df.columns.get_loc("DIFFICULTY")+1) if "DIFFICULTY" in df.columns else 0)
+    if data_source == "SEOmonitor":
+        st.subheader("Column mapping")
+        col_keyword = st.selectbox("Keyword column", options=df.columns.tolist(), index=0)
+        col_volume  = st.selectbox("Monthly search volume", options=df.columns.tolist(), index=df.columns.get_loc("VOLUME") if "VOLUME" in df.columns else 0)
+        # Optional DIFFICULTY; fallback to Medium
+        col_diff    = st.selectbox("Keyword Difficulty", options=["<none>"] + df.columns.tolist(),
+                                   index=(df.columns.get_loc("DIFFICULTY")+1) if "DIFFICULTY" in df.columns else 0)
 
-    # Starting rank (if absent, default 100)
-    guess_rank_cols = [c for c in df.columns if "RANK" in c.upper() and "[M]" in c.upper()]
-    col_rank = st.selectbox("Starting rank", options=["<none>"] + df.columns.tolist(),
-                            index=(df.columns.get_loc(guess_rank_cols[0])+1) if guess_rank_cols else 0)
+        # Starting rank (if absent, default 100)
+        guess_rank_cols = [c for c in df.columns if "RANK" in c.upper() and "[M]" in c.upper()]
+        col_rank = st.selectbox("Starting rank", options=["<none>"] + df.columns.tolist(),
+                                index=(df.columns.get_loc(guess_rank_cols[0])+1) if guess_rank_cols else 0)
 
-    col_intent = st.selectbox(
-        "Intent column",
-        options=["<none>"] + df.columns.tolist(),
-        index=(df.columns.get_loc("INTENT") + 1) if "INTENT" in df.columns else 0,
-    )
-    col_group = st.selectbox(
-        "Main keyword group",
-        options=["<none>"] + df.columns.tolist(),
-        index=(df.columns.get_loc("GROUPS") + 1) if "GROUPS" in df.columns else 0,
-    )
+        col_intent = st.selectbox(
+            "Intent column",
+            options=["<none>"] + df.columns.tolist(),
+            index=(df.columns.get_loc("INTENT") + 1) if "INTENT" in df.columns else 0,
+        )
+        col_group = st.selectbox(
+            "Main keyword group",
+            options=["<none>"] + df.columns.tolist(),
+            index=(df.columns.get_loc("GROUPS") + 1) if "GROUPS" in df.columns else 0,
+        )
+        intent_flag_cols: list[str] = []
+        diffs_present = []
+        intent_mode = "single"
+    else:
+        st.subheader("Ahrefs format detected")
+        col_keyword = "Keyword"
+        col_volume = "Volume"
+        rank_candidates = [c for c in ["Current position", "Previous position"] if c in df.columns]
+        col_rank = rank_candidates[0] if rank_candidates else "<none>"
+        col_diff = "<none>"
+        col_intent = "<none>"
+        col_group = "<none>"
+        intent_flag_cols = [c for c in AHREFS_INTENT_FLAGS if c in df.columns]
+        missing_cols = [c for c in [col_keyword, col_volume] if c not in df.columns]
+        if missing_cols:
+            st.error(f"Missing expected columns: {', '.join(missing_cols)}")
+            st.stop()
+        st.caption(
+            "Using Ahrefs export:"
+            "Intent flags will be used when aggregating uplift. Difficulty defaults to Top10 for ranks ≤10 and Medium otherwise until Google Ads data refines it."
+        )
+        diffs_present = ["Medium", "Top10"]
+        intent_mode = "flags"
 
 def _normalize_difficulty_label(value):
     text = str(value).strip()
     return text if text else "N/A"
 
-if col_diff != "<none>":
+
+def _apply_competition_difficulty(work_df: pd.DataFrame, gads_df: pd.DataFrame) -> pd.DataFrame:
+    if gads_df is None or gads_df.empty or "keyword_norm" not in gads_df.columns:
+        return work_df
+    df_norm = gads_df.dropna(subset=["keyword_norm", "competition_level"]).copy()
+    if df_norm.empty:
+        return work_df
+    df_norm["keyword_norm"] = df_norm["keyword_norm"].astype(str).str.lower().str.strip()
+    df_norm["competition_level"] = df_norm["competition_level"].astype(str).str.upper().str.strip()
+    comp_map = df_norm.set_index("keyword_norm")["competition_level"].to_dict()
+    if not comp_map:
+        return work_df
+    work_df = work_df.copy()
+    norm_kw = work_df["KEYWORD"].astype(str).str.lower().str.strip()
+    mapped = norm_kw.map(lambda k: COMPETITION_TO_DIFFICULTY.get(comp_map.get(k, ""), None))
+    work_df["DIFFICULTY"] = mapped.fillna(work_df["DIFFICULTY"])
+    # Preserve Top10 override for already-high ranking keywords
+    work_df.loc[work_df["START_RANK"] <= 10, "DIFFICULTY"] = "Top10"
+    work_df["DIFFICULTY"] = work_df["DIFFICULTY"].fillna("N/A")
+    return work_df
+
+
+if data_source == "SEOmonitor" and col_diff != "<none>":
     diffs_present = [_normalize_difficulty_label(v) for v in df[col_diff].unique()]
+elif data_source == "Ahrefs":
+    diffs_present = ["Medium", "Top10"]
 else:
     diffs_present = []
 
-default_keys = ["Easy", "Medium", "Hard", "Top10", "N/A"]
+if data_source == "Ahrefs":
+    default_keys = ["Medium", "Top10", "Low", "High", "N/A"]
+    default_map = {"Medium": 1.0, "Top10": 2.2, "Low": 0.8, "High": 1.6, "N/A": 1.0}
+else:
+    default_keys = ["Easy", "Medium", "Hard", "Top10", "Low", "High", "N/A"]
+    default_map = {"Easy": 0.6, "Medium": 1.0, "Hard": 1.6, "Top10": 2.2, "Low": 0.8, "High": 1.6, "N/A": 1.0}
 keys = list(dict.fromkeys(default_keys + diffs_present))
-default_map = {"Easy": 0.6, "Medium": 1.0, "Hard": 1.6, "Top10": 2.2, "N/A": 1.0}
 
 # ---------- Parameters ----------
 with st.sidebar:
@@ -390,6 +494,8 @@ if col_intent != "<none>":
     selected_cols.append(col_intent)
 if col_group != "<none>":
     selected_cols.append(col_group)
+if intent_flag_cols:
+    selected_cols.extend(intent_flag_cols)
 
 selected_cols = list(dict.fromkeys(selected_cols))
 work = df[selected_cols].copy()
@@ -436,6 +542,11 @@ work.loc[work["DIFFICULTY"].str.upper().isin({"NA", "N/A"}), "DIFFICULTY"] = "N/
 # clean types
 work["VOLUME"] = pd.to_numeric(work["VOLUME"], errors="coerce").fillna(0).clip(lower=0)
 work["START_RANK"] = pd.to_numeric(work["START_RANK"], errors="coerce").fillna(100).clip(lower=1, upper=200)
+if data_source == "Ahrefs":
+    for flag in intent_flag_cols:
+        if flag in work.columns:
+            work[flag] = work[flag].astype(str).str.lower().isin({"true", "1", "yes", "y", "t"})
+    work["DIFFICULTY"] = np.where(work["START_RANK"] <= 10, "Top10", "Medium")
 
 vol_max = work["VOLUME"].max() if vol_max_mode == "Auto from dataset" else float(vol_max_manual)
 model_signature = (
@@ -450,8 +561,11 @@ model_signature = (
     float(v_span),
     float(m_min),
     float(m_max),
+    data_source,
+    intent_mode,
     col_intent,
     col_group,
+    tuple(intent_flag_cols),
     tuple(sorted((str(key), float(val)) for key, val in m_d.items())),
     tuple(sorted((str(key), None if val is None else float(val)) for key, val in rank_caps.items())),
 )
@@ -536,7 +650,7 @@ def _parse_geo_ids(s: str) -> list[str]:
 
 def fetch_historical_metrics_gads(client, customer_id: str, keywords: list[str],
                                   geo_ids: list[str], language_id: str,
-                                  batch_size: int = 700) -> tuple[pd.DataFrame, list]:
+                                  batch_size: int = 500) -> tuple[pd.DataFrame, list]:
     try:
         from google.protobuf.json_format import MessageToDict
     except Exception:
@@ -547,9 +661,10 @@ def fetch_historical_metrics_gads(client, customer_id: str, keywords: list[str],
 
     out_rows, raw_results = [], []
     total = len(keywords)
-    prog = st.progress(0.0, text="Requesting batches…")
+    total_batches = max(1, math.ceil(total / max(batch_size, 1)))
+    prog = st.progress(0.0, text=f"Requesting batches (0 / {total})")
 
-    for i in range(0, total, batch_size):
+    for batch_idx, i in enumerate(range(0, total, batch_size), start=1):
         batch = keywords[i:i+batch_size]
         req = client.get_type("GenerateKeywordHistoricalMetricsRequest")
         req.customer_id = customer_id
@@ -559,7 +674,28 @@ def fetch_historical_metrics_gads(client, customer_id: str, keywords: list[str],
         for gid in geo_ids:
             req.geo_target_constants.append(googleads_service.geo_target_constant_path(gid))
 
-        resp = idea_service.generate_keyword_historical_metrics(request=req)
+        resp = None
+        last_exc = None
+        max_retries = 5
+        base_wait = 5.0
+        for attempt in range(max_retries):
+            try:
+                # Respect per-method quota guidance with a small delay between batches
+                if attempt == 0 and batch_idx > 1:
+                    time.sleep(base_wait)
+                resp = idea_service.generate_keyword_historical_metrics(request=req)
+                break
+            except Exception as e:
+                last_exc = e
+                err_text = str(e).upper()
+                if "RESOURCE_EXHAUSTED" in err_text or "TOO MANY REQUESTS" in err_text or "429" in err_text:
+                    wait = base_wait * (attempt + 1)
+                    st.warning(f"Rate limit hit on batch {batch_idx}/{total_batches}. Retrying in {wait:.1f}s...")
+                    time.sleep(wait)
+                    continue
+                raise
+        if resp is None and last_exc:
+            raise last_exc
 
         if MessageToDict:
             raw_results.extend([MessageToDict(r._pb) for r in resp.results])
@@ -596,7 +732,11 @@ def fetch_historical_metrics_gads(client, customer_id: str, keywords: list[str],
             else:
                 out_rows.append(base | {"year": None, "month": None, "monthly_searches": None})
 
-        prog.progress(min((i+batch_size)/max(total,1),1.0))
+        done = min(i + batch_size, total)
+        prog.progress(
+            min(done / max(total, 1), 1.0),
+            text=f"Requesting batches ({done} / {total}) — batch {batch_idx}/{total_batches}"
+        )
 
     df = pd.DataFrame(out_rows)
     if not df.empty and "aliases" in df.columns:
@@ -613,6 +753,30 @@ if proj_mode == "Seasonal":
         work["KEYWORD"].astype(str).str.strip().str.lower()
         .replace("", pd.NA).dropna().unique().tolist()
     )
+    proceed_with_fetch = True
+    if data_source == "Ahrefs":
+        threshold = 1000
+        count = len(to_query)
+        if count > threshold:
+            sig = ("ahrefs", count)
+            if st.session_state.get("ahrefs_confirm_signature") != sig:
+                st.session_state["ahrefs_confirm_signature"] = sig
+                st.session_state["ahrefs_fetch_confirmed"] = False
+            st.info(f"Google Ads fetch will query {count:,} keywords (batched at 500 per request).")
+            st.checkbox(
+                "I understand this may take time and want to proceed",
+                key="ahrefs_fetch_confirmed",
+            )
+            proceed_with_fetch = bool(st.session_state.get("ahrefs_fetch_confirmed", False))
+            if not proceed_with_fetch:
+                st.warning(
+                    f"Confirm to fetch Google Ads data for {count:,} keywords. Until confirmed, running in Average mode without Ads seasonality/difficulty."
+                )
+                proj_mode = "Average"
+        else:
+            st.info(f"Google Ads fetch will query {count:,} keywords (below {threshold:,} gate; proceeding automatically).")
+    if proj_mode != "Seasonal":
+        proceed_with_fetch = False
 
     # Derive default geo/language from secrets or defaults
     geo_ids = _DEFAULT_GEO_IDS
@@ -627,18 +791,30 @@ if proj_mode == "Seasonal":
     except Exception:
         pass
 
-    seasonality_key = ("gads_v20_seasonal", tuple(sorted(to_query)), tuple(sorted(geo_ids)), lang_id)
-    if st.session_state.get("gads_results_key") != seasonality_key:
-        client, effective_id = get_gads_client_and_customer_id()
-        if client and effective_id:
-            with st.spinner("Loading Search Volumes from Google Ads…"):
-                gads_df, raw_json = fetch_historical_metrics_gads(client, effective_id, to_query, geo_ids, lang_id)
-            st.session_state.gads_results_key = seasonality_key
-            st.session_state.gads_results_df = gads_df
-            st.session_state.gads_raw_json = raw_json
-        else:
-            st.warning("Google Ads credentials not available. Using average volumes instead.")
-            proj_mode = "Average"
+    if proceed_with_fetch:
+        seasonality_key = ("gads_v20_seasonal", tuple(sorted(to_query)), tuple(sorted(geo_ids)), lang_id)
+        if st.session_state.get("gads_results_key") != seasonality_key:
+            client, effective_id = get_gads_client_and_customer_id()
+            if client and effective_id:
+                with st.spinner("Loading Search Volumes from Google Ads…"):
+                    gads_df, raw_json = fetch_historical_metrics_gads(client, effective_id, to_query, geo_ids, lang_id)
+                st.session_state.gads_results_key = seasonality_key
+                st.session_state.gads_results_df = gads_df
+                st.session_state.gads_raw_json = raw_json
+            else:
+                st.warning("Google Ads credentials not available. Using average volumes instead.")
+                proj_mode = "Average"
+                proceed_with_fetch = False
+    else:
+        seasonality_key = None
+
+# If we have Google Ads competition data, map to difficulty (Low/Medium/High) and preserve Top10 override
+comp_df = st.session_state.get("gads_results_df")
+if comp_df is not None:
+    try:
+        work = _apply_competition_difficulty(work, comp_df)
+    except Exception:
+        pass
 
 # Extend model signature to account for projection mode and seasonality inputs
 model_signature = model_signature + (
@@ -862,9 +1038,10 @@ st.altair_chart(visits_chart, use_container_width=True)
 st.divider()
 
 @st.cache_data(show_spinner=False)
-def batch_forecast(work_df, horizon, ctr_arr_tuple, model_signature):
+def batch_forecast(work_df, horizon, ctr_arr_tuple, model_signature, intent_mode, intent_flags_tuple):
     _ = model_signature  # ensures cache invalidates when model settings change
     ctr_arr = tuple(ctr_arr_tuple)
+    intent_flags = tuple(intent_flags_tuple)
     out_rows = []
 
     # Precompute month start dates aligned to projection start
@@ -910,6 +1087,10 @@ def batch_forecast(work_df, horizon, ctr_arr_tuple, model_signature):
         return vec
 
     for _, rw in work_df.iterrows():
+        flag_values = {}
+        if intent_mode == "flags":
+            for flag in intent_flags:
+                flag_values[flag] = bool(rw.get(flag, False))
         proj = project_keyword(rw, horizon)
         ctr_vals = np.array([ctr_top20(r, ctr_arr) for r in proj])
 
@@ -939,7 +1120,7 @@ def batch_forecast(work_df, horizon, ctr_arr_tuple, model_signature):
                 "EXP_VISITS": round(float(vs), 2),
                 "BASELINE_VISITS": round(float(base_vs), 2),
                 "EXP_UPLIFT": round(float(uplift_vs), 2),
-            })
+            } | flag_values)
     out = pd.DataFrame(out_rows)
     future_rows = out[out["MONTH_AHEAD"] > 0].copy()
 
@@ -969,29 +1150,57 @@ def batch_forecast(work_df, horizon, ctr_arr_tuple, model_signature):
             .reset_index()
         )
 
-    intent_df = (
-        future_rows
-        .groupby(["MONTH_START", "INTENT"], as_index=False)
-        .agg(UPLIFT=("EXP_UPLIFT", "sum"))
-    )
-    if intent_df.empty:
-        intent_pivot = pd.DataFrame(columns=["MONTH_START"])
+    intent_long = pd.DataFrame(columns=["MONTH_START", "INTENT", "UPLIFT"])
+    if intent_mode == "flags" and intent_flags:
+        long_parts = []
+        for flag in intent_flags:
+            if flag not in future_rows.columns:
+                continue
+            sub = future_rows[future_rows[flag].astype(bool)]
+            if sub.empty:
+                continue
+            agg = sub.groupby("MONTH_START", as_index=False)["EXP_UPLIFT"].sum()
+            agg = agg.rename(columns={"EXP_UPLIFT": "UPLIFT"})
+            agg["INTENT"] = flag
+            long_parts.append(agg)
+        if long_parts:
+            intent_long = pd.concat(long_parts, ignore_index=True)
+            intent_pivot = (
+                intent_long
+                .pivot(index="MONTH_START", columns="INTENT", values="UPLIFT")
+                .fillna(0.0)
+                .reset_index()
+            )
+        else:
+            intent_pivot = pd.DataFrame(columns=["MONTH_START"])
     else:
-        intent_df = intent_df.sort_values(["MONTH_START", "INTENT"])
-        intent_df["INTENT"] = intent_df["INTENT"].fillna(DEFAULT_INTENT_LABEL).astype(str)
-        intent_pivot = (
-            intent_df.pivot(index="MONTH_START", columns="INTENT", values="UPLIFT")
-            .fillna(0.0)
-            .reset_index()
+        intent_df = (
+            future_rows
+            .groupby(["MONTH_START", "INTENT"], as_index=False)
+            .agg(UPLIFT=("EXP_UPLIFT", "sum"))
         )
+        if intent_df.empty:
+            intent_pivot = pd.DataFrame(columns=["MONTH_START"])
+        else:
+            intent_df = intent_df.sort_values(["MONTH_START", "INTENT"])
+            intent_df["INTENT"] = intent_df["INTENT"].fillna(DEFAULT_INTENT_LABEL).astype(str)
+            intent_pivot = (
+                intent_df.pivot(index="MONTH_START", columns="INTENT", values="UPLIFT")
+                .fillna(0.0)
+                .reset_index()
+            )
+        intent_long = intent_df
 
-    return out, agg_total, cat_pivot, cat_df, intent_pivot, intent_df
+    return out, agg_total, cat_pivot, cat_df, intent_pivot, intent_long
 
 
 with st.spinner("Running projections..."):
     proj_df, agg_month_df, cat_pivot, cat_long, intent_pivot, intent_long = batch_forecast(
-        work, horizon, tuple(CTR_ARR), model_signature
+        work, horizon, tuple(CTR_ARR), model_signature, intent_mode, tuple(intent_flag_cols)
     )
+    if data_source == "Ahrefs":
+        cat_pivot = pd.DataFrame(columns=["MONTH_START"])
+        cat_long = pd.DataFrame(columns=["MONTH_START", "CATEGORY", "UPLIFT"])
 
 total_uplift_sum = float(agg_month_df["TOTAL_UPLIFT"].sum()) if not agg_month_df.empty else 0.0
 total_baseline_sum = float(agg_month_df["TOTAL_BASELINE"].sum()) if not agg_month_df.empty else 0.0
@@ -1138,7 +1347,9 @@ else:
 
 st.write("")
 st.subheader("Uplift by Category")
-if not cat_long.empty:
+if data_source == "Ahrefs":
+    st.info("Category uplift not available for Ahrefs imports.")
+elif not cat_long.empty:
     cat_chart = (
         alt.Chart(cat_long)
         .mark_bar()
@@ -1159,7 +1370,8 @@ else:
     st.info("No category data available for projection.")
 
 st.write("")
-st.subheader("Uplift by Intent")
+intent_title = "Uplift by Intent Flags" if intent_mode == "flags" else "Uplift by Intent"
+st.subheader(intent_title)
 if not intent_long.empty:
     intent_chart = (
         alt.Chart(intent_long)
@@ -1167,10 +1379,10 @@ if not intent_long.empty:
         .encode(
             x=alt.X("yearmonth(MONTH_START):O", title=None),
             y=alt.Y("UPLIFT:Q", title="Uplift"),
-            color=alt.Color("INTENT:N", title="Intent"),
+            color=alt.Color("INTENT:N", title="Intent flag" if intent_mode == "flags" else "Intent"),
             tooltip=[
                 alt.Tooltip("yearmonth(MONTH_START):T", title="Month"),
-                alt.Tooltip("INTENT:N", title="Intent"),
+                alt.Tooltip("INTENT:N", title="Intent flag" if intent_mode == "flags" else "Intent"),
                 alt.Tooltip("UPLIFT:Q", title="Uplift", format=",.0f"),
             ],
         )
@@ -1178,11 +1390,12 @@ if not intent_long.empty:
     )
     st.altair_chart(intent_chart, use_container_width=True)
 else:
-    st.info("No intent data available for projection.")
+    msg = "No intent flags present in this dataset." if intent_mode == "flags" else "No intent data available for projection."
+    st.info(msg)
 
 st.download_button(
     "Download detailed projections (CSV)",
-    data=proj_df.to_csv(index=False).encode("utf-8"),
+    data=(proj_df.drop(columns=["CATEGORY", "MAIN_CATEGORY"], errors="ignore") if data_source == "Ahrefs" else proj_df).to_csv(index=False).encode("utf-8"),
     file_name="rank_traffic_projection.csv",
     mime="text/csv"
 )
